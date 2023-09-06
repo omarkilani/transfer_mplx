@@ -6,7 +6,7 @@ import (
 
 	"encoding/json"
 	"io/ioutil"
-	_ "os"
+	"os"
 
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
@@ -23,8 +23,18 @@ func AccountFromFile(fn string) (types.Account, error) {
 		return types.Account{}, err
 	}
 
+	acc, err := AccountFromJSONArray(j)
+	if err != nil {
+		return types.Account{}, err
+	}
+
+	log.Printf("AccountFromFile: loaded pubkey %v from %v\n", acc.PublicKey, fn)
+	return acc, nil
+}
+
+func AccountFromJSONArray(j []byte) (types.Account, error) {
 	var bs []byte
-	err = json.Unmarshal(j, &bs)
+	err := json.Unmarshal(j, &bs)
 	if err != nil {
 		return types.Account{}, err
 	}
@@ -34,8 +44,16 @@ func AccountFromFile(fn string) (types.Account, error) {
 		return types.Account{}, err
 	}
 
-	log.Printf("AccountFromFile: loaded pubkey %v from %v\n", acc.PublicKey, fn)
 	return acc, nil
+}
+
+func AccountFromEnvJSON(env string) (types.Account, error) {
+	jsonStr := os.Getenv(env)
+	if jsonStr == "" {
+		return types.Account{}, nil
+	}
+
+	return AccountFromJSONArray([]byte(jsonStr))
 }
 
 func GetAccountInfo(endpoint string, address string) (accountInfo client.AccountInfo, err error) {
