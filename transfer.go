@@ -174,39 +174,31 @@ func getTransferAddresses(source, dest, nft common.PublicKey, pnft bool) (source
 	return sourceATA, destATA, sourceTR, destTR, err
 }
 
-func TransferMplx(payer types.Account, endpoint string, mint string, receiver string) (string, error) {
-	c := client.NewClient(endpoint)
-
+func MplxTransferIx(payer types.Account, endpoint string, mint string, receiver string) (*types.Instruction, error) {
 	nft := common.PublicKeyFromString(mint)
 	dest := common.PublicKeyFromString(receiver)
 
 	metadata, err := token_metadata.GetTokenMetaPubkey(nft)
 	if err != nil {
-		log.Printf("TransferMplx: failed to find a valid token metadata, err: %v", err)
-		return "", err
+		log.Printf("MplxTransferIx: failed to find a valid token metadata, err: %v", err)
+		return nil, err
 	}
 
 	md, err := GetTokenMetadata(endpoint, metadata.String())
 	if err != nil {
-		log.Printf("TransferMplx: failed to get account info, err: %v", err)
-		return "", err
+		log.Printf("MplxTransferIx: failed to get account info, err: %v", err)
+		return nil, err
 	}
 
 	isPNFT := md.TokenStandard != nil && *md.TokenStandard == token_metadata.ProgrammableNonFungible
 
 	sourceATA, destATA, sourceTR, destTR, err := getTransferAddresses(payer.PublicKey, dest, nft, isPNFT)
 	if err != nil {
-		log.Printf("TransferMplx: failed to get transfer addresses, err: %v", err)
-		return "", err
+		log.Printf("MplxTransferIx: failed to get transfer addresses, err: %v", err)
+		return nil, err
 	}
 
-	log.Printf("TransferMplx: sourceATA %+v sourceTR %v, destATA %+v destTR %v\n", sourceATA, sourceTR, destATA, destTR)
-
-	recentBlockhashResponse, err := c.GetLatestBlockhash(context.Background())
-	if err != nil {
-		log.Printf("TransferMplx: failed to get recent blockhash, err: %v", err)
-		return "", err
-	}
+	log.Printf("MplxTransferIx: sourceATA %+v sourceTR %v, destATA %+v destTR %v\n", sourceATA, sourceTR, destATA, destTR)
 
 	data, err := borsh.Serialize(struct {
 		Instruction token_metadata.Instruction
@@ -224,7 +216,7 @@ func TransferMplx(payer types.Account, endpoint string, mint string, receiver st
 	edition, err := token_metadata.GetMasterEdition(nft)
 	if err != nil {
 		log.Printf("TransferMplx: failed to get master edition, err: %v", err)
-		return "", err
+		return nil, err
 	}
 
 	ruleSet := common.MetaplexTokenMetaProgramID
@@ -232,10 +224,27 @@ func TransferMplx(payer types.Account, endpoint string, mint string, receiver st
 		ruleSet = *md.ProgrammableConfig.V1.RuleSet
 	}
 
-	log.Printf("TransferMplx: ruleSet %+v\n", ruleSet)
+	log.Printf("MplxTransferIx: ruleSet %+v\n", ruleSet)
 
 	transferIx := buildTransferInstruction(payer.PublicKey, sourceATA,
 		destATA, dest, nft, metadata, edition, sourceTR, destTR, ruleSet, data)
+
+	return &transferIx, nil
+}
+
+func TransferMplx(payer types.Account, endpoint string, mint string, receiver string) (string, error) {
+	transferIx, err := MplxTransferIx(payer, endpoint, mint, receiver)
+	if err != nil {
+		log.Printf("TransferMplx: failed to build transfer instruction, err: %v", err)
+		return "", err
+	}
+
+	c := client.NewClient(endpoint)
+	recentBlockhashResponse, err := c.GetLatestBlockhash(context.Background())
+	if err != nil {
+		log.Printf("TransferMplx: failed to get recent blockhash, err: %v", err)
+		return "", err
+	}
 
 	tx, err := types.NewTransaction(types.NewTransactionParam{
 		Signers: []types.Account{payer},
@@ -243,7 +252,7 @@ func TransferMplx(payer types.Account, endpoint string, mint string, receiver st
 			FeePayer:        payer.PublicKey,
 			RecentBlockhash: recentBlockhashResponse.Blockhash,
 			Instructions: []types.Instruction{
-				transferIx,
+				*transferIx,
 			},
 		}),
 	})
