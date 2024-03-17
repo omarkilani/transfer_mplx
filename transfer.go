@@ -11,6 +11,7 @@ import (
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
 	_ "github.com/blocto/solana-go-sdk/pkg/pointer"
+	"github.com/blocto/solana-go-sdk/program/compute_budget"
 	"github.com/blocto/solana-go-sdk/program/metaplex/token_metadata"
 	_ "github.com/blocto/solana-go-sdk/rpc"
 	"github.com/blocto/solana-go-sdk/types"
@@ -233,6 +234,10 @@ func MplxTransferIx(payer types.Account, endpoint string, mint string, receiver 
 }
 
 func TransferMplx(payer types.Account, endpoint string, mint string, receiver string) (string, error) {
+	return TransferMplxWithFee(payer, endpoint, mint, receiver, 0)
+}
+
+func TransferMplxWithFee(payer types.Account, endpoint string, mint string, receiver string, priorityFee uint64) (string, error) {
 	transferIx, err := MplxTransferIx(payer, endpoint, mint, receiver)
 	if err != nil {
 		log.Printf("TransferMplx: failed to build transfer instruction, err: %v", err)
@@ -246,14 +251,22 @@ func TransferMplx(payer types.Account, endpoint string, mint string, receiver st
 		return "", err
 	}
 
+	instructions := []types.Instruction{*transferIx}
+
+	if priorityFee > 0 {
+		priorityFeeIx := compute_budget.SetComputeUnitPrice(compute_budget.SetComputeUnitPriceParam{
+			MicroLamports: priorityFee,
+		})
+
+		instructions = append([]types.Instruction{priorityFeeIx}, instructions...)
+	}
+
 	tx, err := types.NewTransaction(types.NewTransactionParam{
 		Signers: []types.Account{payer},
 		Message: types.NewMessage(types.NewMessageParam{
 			FeePayer:        payer.PublicKey,
 			RecentBlockhash: recentBlockhashResponse.Blockhash,
-			Instructions: []types.Instruction{
-				*transferIx,
-			},
+			Instructions:    instructions,
 		}),
 	})
 
