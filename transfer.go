@@ -294,6 +294,13 @@ func WithPayerFromEnvJSON(env string) func(*Transfer) error {
 	}
 }
 
+func WithPayer(payer types.Account) func(*Transfer) error {
+	return func(t *Transfer) error {
+		t.payer = payer
+		return nil
+	}
+}
+
 func WithPriorityFee(priorityFee uint64) func(*Transfer) error {
 	return func(t *Transfer) error {
 		t.priorityFee = priorityFee
