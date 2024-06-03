@@ -308,9 +308,9 @@ func WithProtocol(protocol Protocol) func(*Transfer) error {
 	}
 }
 
-func WithCollection[A ~string](collection string) func(*Transfer) error {
+func WithCollection[A ~string](collection A) func(*Transfer) error {
 	return func(t *Transfer) error {
-		c := common.PublicKeyFromString(collection)
+		c := common.PublicKeyFromString(string(collection))
 		t.collection = &c
 		return nil
 	}
