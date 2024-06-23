@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 
+	"encoding/base64"
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
 	_ "github.com/blocto/solana-go-sdk/pkg/pointer"
@@ -28,6 +29,53 @@ const (
 	MplCore          Protocol = "mpl-core"
 	MplTokenMetadata Protocol = "mpl-token-metadata"
 )
+
+type Account types.Account
+
+func (a Account) String() string {
+	return types.Account(a).PublicKey.ToBase58()
+}
+
+func AccountFromBase58(input string) (Account, error) {
+	account, err := types.AccountFromBase58(input)
+	if err != nil {
+		return Account{}, err
+	}
+
+	return Account(account), nil
+}
+
+func AccountFromJSON(input []byte) (Account, error) {
+	var bytes []byte
+	if err := json.Unmarshal(input, &bytes); err != nil {
+		return Account{}, err
+	}
+
+	account, err := types.AccountFromBytes(bytes)
+	if err != nil {
+		return Account{}, err
+	}
+
+	return Account(account), nil
+}
+
+func AccountFromFile(fn string) (Account, error) {
+	json, err := os.ReadFile(fn)
+	if err != nil {
+		return Account{}, err
+	}
+
+	return AccountFromJSON(json)
+}
+
+func AccountFromEnvJSON(env string) (Account, error) {
+	json := os.Getenv(env)
+	if json == "" {
+		return Account{}, fmt.Errorf("no env var %s", env)
+	}
+
+	return AccountFromJSON([]byte(json))
+}
 
 type Client struct {
 	rpc *client.Client
@@ -62,7 +110,7 @@ func (c Client) mplCoreIx(transfer Transfer) (*types.Instruction, error) {
 		Accounts: []types.AccountMeta{
 			{PubKey: transfer.mint, IsWritable: true},
 			collectionOrDefault,
-			{PubKey: transfer.payer.PublicKey, IsSigner: true, IsWritable: true},
+			{PubKey: transfer.sender, IsSigner: true, IsWritable: true},
 			defaultAccount,
 			{PubKey: transfer.receiver},
 			defaultAccount,
@@ -121,7 +169,7 @@ func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error
 		ProgramID: common.MetaplexTokenMetaProgramID,
 		Accounts: []types.AccountMeta{
 			{PubKey: sourceATA, IsWritable: true},
-			{PubKey: transfer.payer.PublicKey, IsSigner: true, IsWritable: true},
+			{PubKey: transfer.sender, IsSigner: true, IsWritable: true},
 			{PubKey: destATA, IsWritable: true},
 			{PubKey: transfer.receiver},
 			{PubKey: transfer.mint},
@@ -129,8 +177,8 @@ func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error
 			{PubKey: edition},
 			{PubKey: sourceTR, IsWritable: true},
 			{PubKey: destTR, IsWritable: true},
-			{PubKey: transfer.payer.PublicKey, IsSigner: true, IsWritable: true},
-			{PubKey: transfer.payer.PublicKey, IsSigner: true, IsWritable: true},
+			{PubKey: transfer.sender, IsSigner: true, IsWritable: true},
+			{PubKey: transfer.sender, IsSigner: true, IsWritable: true},
 			{PubKey: common.SystemProgramID},
 			{PubKey: common.SysVarInstructionsPubkey},
 			{PubKey: common.TokenProgramID},
@@ -153,15 +201,15 @@ func (c Client) transferIx(transfer Transfer) (*types.Instruction, error) {
 	}
 }
 
-func (c Client) Do(transfer Transfer) (string, error) {
+func (c Client) transaction(transfer Transfer) (types.Transaction, error) {
 	ix, err := c.transferIx(transfer)
 	if err != nil {
-		return "", fmt.Errorf("cannot build instruction: %w", err)
+		return types.Transaction{}, fmt.Errorf("cannot build instruction: %w", err)
 	}
 
 	recentBlockhashResponse, err := c.rpc.GetLatestBlockhash(context.Background())
 	if err != nil {
-		return "", fmt.Errorf("no recent blockhash: %w", err)
+		return types.Transaction{}, fmt.Errorf("no recent blockhash: %w", err)
 	}
 
 	instructions := []types.Instruction{*ix}
@@ -174,14 +222,43 @@ func (c Client) Do(transfer Transfer) (string, error) {
 		instructions = append([]types.Instruction{priorityFeeIx}, instructions...)
 	}
 
-	tx, err := types.NewTransaction(types.NewTransactionParam{
-		Signers: []types.Account{transfer.payer},
+	return types.NewTransaction(types.NewTransactionParam{
 		Message: types.NewMessage(types.NewMessageParam{
-			FeePayer:        transfer.payer.PublicKey,
+			FeePayer:        transfer.sender,
 			RecentBlockhash: recentBlockhashResponse.Blockhash,
 			Instructions:    instructions,
 		}),
 	})
+}
+
+func (c Client) RawTx(transfer Transfer) (string, error) {
+	tx, err := c.transaction(transfer)
+	if err != nil {
+		return "", fmt.Errorf("cannot build transaction: %w", err)
+	}
+
+	rawTx, err := tx.Serialize()
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize tx, err: %v", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(rawTx), nil
+}
+
+func (c Client) Do(transfer Transfer, signer Account) (string, error) {
+	tx, err := c.transaction(transfer)
+	if err != nil {
+		return "", fmt.Errorf("cannot build transaction: %w", err)
+	}
+
+	data, err := tx.Message.Serialize()
+	if err != nil {
+		return "", fmt.Errorf("cannot serialize message, err: %v", err)
+	}
+
+	if err := tx.AddSignature(types.Account(signer).Sign(data)); err != nil {
+		return "", fmt.Errorf("cannot sign tx: %w", err)
+	}
 
 	slog.Debug("Do", "tx", tx, "err", err)
 
@@ -212,19 +289,16 @@ func (c Client) getTokenMetadata(address common.PublicKey) (token_metadata.Metad
 type Transfer struct {
 	collection  *common.PublicKey
 	mint        common.PublicKey
-	payer       types.Account
+	sender      common.PublicKey
 	priorityFee uint64
 	protocol    Protocol
 	receiver    common.PublicKey
 }
 
-func (t Transfer) Payer() types.Account {
-	return t.payer
-}
-
-func NewTransfer[A ~string, B ~string](mint A, receiver B, options ...func(*Transfer) error) (Transfer, error) {
+func NewTransfer[A ~string, B ~string](mint A, sender B, receiver B, options ...func(*Transfer) error) (Transfer, error) {
 	transfer := Transfer{
 		mint:     common.PublicKeyFromString(string(mint)),
+		sender:   common.PublicKeyFromString(string(sender)),
 		receiver: common.PublicKeyFromString(string(receiver)),
 		protocol: MplTokenMetadata,
 	}
@@ -235,70 +309,7 @@ func NewTransfer[A ~string, B ~string](mint A, receiver B, options ...func(*Tran
 		}
 	}
 
-	if transfer.payer.PublicKey == (common.PublicKey{}) {
-		return Transfer{}, fmt.Errorf("no payer")
-	}
-
 	return transfer, nil
-}
-
-func WithPayerFromBase58(input string) func(*Transfer) error {
-	return func(t *Transfer) error {
-		payer, err := types.AccountFromBase58(input)
-		if err != nil {
-			return err
-		}
-
-		t.payer = payer
-		return nil
-	}
-}
-
-func WithPayerFromJSON(input []byte) func(*Transfer) error {
-	return func(t *Transfer) error {
-		var bytes []byte
-		if err := json.Unmarshal(input, &bytes); err != nil {
-			return err
-		}
-
-		payer, err := types.AccountFromBytes(bytes)
-		if err != nil {
-			return err
-		}
-
-		t.payer = payer
-
-		return nil
-	}
-}
-
-func WithPayerFromFile(fn string) func(*Transfer) error {
-	return func(t *Transfer) error {
-		json, err := os.ReadFile(fn)
-		if err != nil {
-			return err
-		}
-
-		return WithPayerFromJSON(json)(t)
-	}
-}
-
-func WithPayerFromEnvJSON(env string) func(*Transfer) error {
-	return func(t *Transfer) error {
-		json := os.Getenv(env)
-		if json == "" {
-			return fmt.Errorf("no env var %s", env)
-		}
-
-		return WithPayerFromJSON([]byte(json))(t)
-	}
-}
-
-func WithPayer(payer types.Account) func(*Transfer) error {
-	return func(t *Transfer) error {
-		t.payer = payer
-		return nil
-	}
 }
 
 func WithPriorityFee(priorityFee uint64) func(*Transfer) error {
@@ -324,7 +335,7 @@ func WithCollection[A ~string](collection A) func(*Transfer) error {
 }
 
 func (t Transfer) Addresses(pnft bool) (sourceATA, destATA, sourceTR, destTR common.PublicKey, err error) {
-	sourceATA, _, err = common.FindAssociatedTokenAddress(t.payer.PublicKey, t.mint)
+	sourceATA, _, err = common.FindAssociatedTokenAddress(t.sender, t.mint)
 	if err != nil {
 		return sourceATA, destATA, sourceTR, destTR, fmt.Errorf("no associated token address for source: %w", err)
 	}
