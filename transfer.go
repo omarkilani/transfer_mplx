@@ -36,6 +36,10 @@ func (a Account) String() string {
 	return types.Account(a).PublicKey.ToBase58()
 }
 
+func NewAccount() Account {
+	return Account(types.NewAccount())
+}
+
 func AccountFromBase58(input string) (Account, error) {
 	account, err := types.AccountFromBase58(input)
 	if err != nil {
