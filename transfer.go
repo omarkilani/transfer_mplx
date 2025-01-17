@@ -378,6 +378,10 @@ func (c Client) transferIx(transfer Transfer) (*types.Instruction, error) {
 		return nil, fmt.Errorf("transfer ix: %w", err)
 	}
 
+	if asset.Ownership.Owner != transfer.sender.String() {
+		return nil, fmt.Errorf("transfer ix: sender does not own NFT")
+	}
+
 	protocol := asset.Protocol()
 
 	switch protocol {
