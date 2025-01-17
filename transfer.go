@@ -10,22 +10,25 @@ import (
 	"encoding/base64"
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
-	_ "github.com/blocto/solana-go-sdk/pkg/pointer"
 	"github.com/blocto/solana-go-sdk/program/compute_budget"
 	"github.com/blocto/solana-go-sdk/program/metaplex/token_metadata"
-	_ "github.com/blocto/solana-go-sdk/rpc"
+	"github.com/blocto/solana-go-sdk/rpc"
 	"github.com/blocto/solana-go-sdk/types"
 	"github.com/near/borsh-go"
 )
 
 const (
-	AuthProgramID         = "auth9SigNpDKz4sJJ1DfCTuZrZNSAgh9sFD3rboVmgg"
-	MetaplexCoreProgramID = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+	AuthProgramID                  = "auth9SigNpDKz4sJJ1DfCTuZrZNSAgh9sFD3rboVmgg"
+	MetaplexBubblegumProgramID     = "BGUMAp9Gq7iTEuizy4pqaxsTyUCBK68MDfK752saRPUY"
+	MetaplexCoreProgramID          = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+	SPLAccountCompressionProgramID = "cmtDvXumGCrqC1Age74AVPhSRVXJMd8PJS91L8KbNCK"
+	SPLNoOpProgramID               = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV"
 )
 
 type Protocol string
 
 const (
+	MplBubblegum     Protocol = "mpl-bubblegum"
 	MplCore          Protocol = "mpl-core"
 	MplTokenMetadata Protocol = "mpl-token-metadata"
 )
@@ -83,15 +86,113 @@ func AccountFromEnvJSON(env string) (Account, error) {
 
 type Client struct {
 	rpc *client.Client
+	ctx context.Context
 }
 
-func NewClient(endpoint string) *Client {
+func NewClient(ctx context.Context, endpoint string) *Client {
 	return &Client{
 		rpc: client.NewClient(endpoint),
+		ctx: ctx,
 	}
 }
 
-func (c Client) mplCoreIx(transfer Transfer) (*types.Instruction, error) {
+type Asset struct {
+	Interface string `json:"interface"`
+	ID        string `json:"id"`
+	Grouping  []struct {
+		GroupKey   string `json:"group_key"`
+		GroupValue string `json:"group_value"`
+	} `json:"grouping"`
+	Ownership struct {
+		Owner    string  `json:"owner"`
+		Delegate *string `json:"delegate"`
+	} `json:"ownership"`
+	Compression struct {
+		Eligible    bool   `json:"eligible"`
+		Compressed  bool   `json:"compressed"`
+		DataHash    string `json:"data_hash"`
+		CreatorHash string `json:"creator_hash"`
+		AssetHash   string `json:"asset_hash"`
+		Tree        string `json:"tree"`
+		Seq         uint64 `json:"seq"`
+		LeafID      uint64 `json:"leaf_id"`
+	} `json:"compression"`
+}
+
+type AssetProof struct {
+	Root      string   `json:"root"`
+	Proof     []string `json:"proof"`
+	NodeIndex uint64   `json:"node_index"`
+	Leaf      string   `json:"leaf"`
+	TreeID    string   `json:"tree_id"`
+}
+
+func (asset Asset) Protocol() Protocol {
+	switch asset.Interface {
+	case "MplCoreAsset":
+		return MplCore
+	default:
+		if asset.Compression.Compressed {
+			return MplBubblegum
+		}
+
+		return MplTokenMetadata
+	}
+}
+
+func (asset Asset) Collection() (common.PublicKey, bool) {
+	for _, group := range asset.Grouping {
+		if group.GroupKey == "collection" {
+			return common.PublicKeyFromString(group.GroupValue), true
+		}
+	}
+
+	return common.PublicKey{}, false
+}
+
+func (c Client) assetProof(mint common.PublicKey) (AssetProof, error) {
+	bytes, err := c.rpc.RpcClient.Call(c.ctx, "getAssetProof", mint.String())
+	if err != nil {
+		return AssetProof{}, err
+	}
+
+	slog.Debug("Got asset proof", "mint", mint, "bytes", string(bytes))
+
+	var output rpc.JsonRpcResponse[AssetProof]
+	err = json.Unmarshal(bytes, &output)
+	if err != nil {
+		return AssetProof{}, err
+	}
+
+	if output.Error != nil {
+		return AssetProof{}, output.Error
+	}
+
+	return output.Result, nil
+}
+
+func (c Client) asset(mint common.PublicKey) (Asset, error) {
+	bytes, err := c.rpc.RpcClient.Call(c.ctx, "getAsset", mint.String())
+	if err != nil {
+		return Asset{}, fmt.Errorf("asset: %w", err)
+	}
+
+	slog.Debug("Got asset", "mint", mint, "bytes", string(bytes))
+
+	var output rpc.JsonRpcResponse[Asset]
+	err = json.Unmarshal(bytes, &output)
+	if err != nil {
+		return Asset{}, fmt.Errorf("asset: %w", err)
+	}
+
+	if output.Error != nil {
+		return Asset{}, fmt.Errorf("asset: %w", output.Error)
+	}
+
+	return output.Result, nil
+}
+
+func (c Client) mplCoreIx(asset Asset, transfer Transfer) (*types.Instruction, error) {
 	data, err := borsh.Serialize(struct {
 		Instruction uint8
 		Something   *string
@@ -105,8 +206,8 @@ func (c Client) mplCoreIx(transfer Transfer) (*types.Instruction, error) {
 	defaultAccount := types.AccountMeta{PubKey: programID}
 
 	collectionOrDefault := defaultAccount
-	if transfer.collection != nil {
-		collectionOrDefault = types.AccountMeta{PubKey: *transfer.collection}
+	if collection, ok := asset.Collection(); ok {
+		collectionOrDefault = types.AccountMeta{PubKey: collection}
 	}
 
 	return &types.Instruction{
@@ -137,7 +238,7 @@ func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error
 
 	isPNFT := md.TokenStandard != nil && *md.TokenStandard == token_metadata.ProgrammableNonFungible
 
-	sourceATA, destATA, sourceTR, destTR, err := transfer.Addresses(isPNFT)
+	sourceATA, destATA, sourceTR, destTR, err := transfer.addresses(isPNFT)
 	if err != nil {
 		return nil, fmt.Errorf("no transfer addresses: %w", err)
 	}
@@ -194,14 +295,100 @@ func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error
 	}, nil
 }
 
+func (c Client) mplBubblegumIx(asset Asset, transfer Transfer) (*types.Instruction, error) {
+	type TransferInstructionData struct {
+		Discriminator [8]byte
+		Root          [32]byte
+		DataHash      [32]byte
+		CreatorHash   [32]byte
+		Nonce         uint64
+		Index         uint64
+	}
+
+	assetProof, err := c.assetProof(transfer.mint)
+	if err != nil {
+		return nil, fmt.Errorf("mplbubblegum ix: %w", err)
+	}
+
+	proofPath := make([]types.AccountMeta, 0)
+	for _, p := range assetProof.Proof {
+		proofPath = append(proofPath, types.AccountMeta{PubKey: common.PublicKeyFromString(p)})
+	}
+
+	programID := common.PublicKeyFromString(MetaplexBubblegumProgramID)
+
+	data, err := borsh.Serialize(TransferInstructionData{
+		Discriminator: [8]byte{163, 52, 200, 231, 140, 3, 69, 186},
+		Root:          common.PublicKeyFromString(assetProof.Root),
+		DataHash:      common.PublicKeyFromString(asset.Compression.DataHash),
+		CreatorHash:   common.PublicKeyFromString(asset.Compression.CreatorHash),
+		Nonce:         asset.Compression.LeafID,
+		Index:         asset.Compression.LeafID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mplbubblegum ix: %w", err)
+	}
+
+	treeAuthority, _, err := common.FindProgramAddress(
+		[][]byte{common.PublicKeyFromString(assetProof.TreeID).Bytes()},
+		common.PublicKeyFromString(MetaplexBubblegumProgramID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("mplbubblegum ix: %w", err)
+	}
+
+	leafOwner := common.PublicKeyFromString(asset.Ownership.Owner)
+
+	leafDelegate := leafOwner
+	if asset.Ownership.Delegate != nil {
+		leafDelegate = common.PublicKeyFromString(*asset.Ownership.Delegate)
+	}
+
+	newLeafOwner := transfer.receiver
+
+	merkleTree := common.PublicKeyFromString(asset.Compression.Tree)
+
+	logWrapper := common.PublicKeyFromString(SPLNoOpProgramID)
+
+	compressionProgram := common.PublicKeyFromString(SPLAccountCompressionProgramID)
+
+	systemProgram := common.SystemProgramID
+
+	accounts := []types.AccountMeta{
+		{PubKey: treeAuthority, IsSigner: false, IsWritable: false},
+		{PubKey: leafOwner, IsSigner: false, IsWritable: false},
+		{PubKey: leafDelegate, IsSigner: false, IsWritable: false},
+		{PubKey: newLeafOwner, IsSigner: false, IsWritable: false},
+		{PubKey: merkleTree, IsSigner: false, IsWritable: true},
+		{PubKey: logWrapper, IsSigner: false, IsWritable: false},
+		{PubKey: compressionProgram, IsSigner: false, IsWritable: false},
+		{PubKey: systemProgram, IsSigner: false, IsWritable: false},
+	}
+
+	for _, p := range proofPath {
+		accounts = append(accounts, p)
+	}
+
+	return &types.Instruction{ProgramID: programID, Accounts: accounts, Data: data}, nil
+}
+
 func (c Client) transferIx(transfer Transfer) (*types.Instruction, error) {
-	switch transfer.protocol {
+	asset, err := c.asset(transfer.mint)
+	if err != nil {
+		return nil, fmt.Errorf("transfer ix: %w", err)
+	}
+
+	protocol := asset.Protocol()
+
+	switch protocol {
+	case MplBubblegum:
+		return c.mplBubblegumIx(asset, transfer)
 	case MplCore:
-		return c.mplCoreIx(transfer)
+		return c.mplCoreIx(asset, transfer)
 	case MplTokenMetadata:
 		return c.mplTokenMetadataIx(transfer)
 	default:
-		return nil, fmt.Errorf("unknown protocol: %s", transfer.protocol)
+		return nil, fmt.Errorf("unknown protocol: %s", protocol)
 	}
 }
 
@@ -211,7 +398,7 @@ func (c Client) transaction(transfer Transfer) (types.Transaction, error) {
 		return types.Transaction{}, fmt.Errorf("cannot build instruction: %w", err)
 	}
 
-	recentBlockhashResponse, err := c.rpc.GetLatestBlockhash(context.Background())
+	recentBlockhashResponse, err := c.rpc.GetLatestBlockhash(c.ctx)
 	if err != nil {
 		return types.Transaction{}, fmt.Errorf("no recent blockhash: %w", err)
 	}
@@ -266,7 +453,7 @@ func (c Client) Do(transfer Transfer, signer Account) (string, error) {
 
 	slog.Debug("Do", "tx", tx, "err", err)
 
-	sig, err := c.rpc.SendTransaction(context.Background(), tx)
+	sig, err := c.rpc.SendTransaction(c.ctx, tx)
 	if err != nil {
 		return "", fmt.Errorf("cannot send tx: %w", err)
 	}
@@ -277,7 +464,7 @@ func (c Client) Do(transfer Transfer, signer Account) (string, error) {
 }
 
 func (c Client) getTokenMetadata(address common.PublicKey) (token_metadata.Metadata, error) {
-	accountInfo, err := c.rpc.GetAccountInfo(context.TODO(), address.String())
+	accountInfo, err := c.rpc.GetAccountInfo(c.ctx, address.String())
 	if err != nil {
 		return token_metadata.Metadata{}, fmt.Errorf("no account info: %w", err)
 	}
@@ -291,11 +478,9 @@ func (c Client) getTokenMetadata(address common.PublicKey) (token_metadata.Metad
 }
 
 type Transfer struct {
-	collection  *common.PublicKey
 	mint        common.PublicKey
 	sender      common.PublicKey
 	priorityFee uint64
-	protocol    Protocol
 	receiver    common.PublicKey
 }
 
@@ -304,7 +489,6 @@ func NewTransfer[A ~string, B ~string](mint A, sender B, receiver B, options ...
 		mint:     common.PublicKeyFromString(string(mint)),
 		sender:   common.PublicKeyFromString(string(sender)),
 		receiver: common.PublicKeyFromString(string(receiver)),
-		protocol: MplTokenMetadata,
 	}
 
 	for _, option := range options {
@@ -323,22 +507,7 @@ func WithPriorityFee(priorityFee uint64) func(*Transfer) error {
 	}
 }
 
-func WithProtocol(protocol Protocol) func(*Transfer) error {
-	return func(t *Transfer) error {
-		t.protocol = protocol
-		return nil
-	}
-}
-
-func WithCollection[A ~string](collection A) func(*Transfer) error {
-	return func(t *Transfer) error {
-		c := common.PublicKeyFromString(string(collection))
-		t.collection = &c
-		return nil
-	}
-}
-
-func (t Transfer) Addresses(pnft bool) (sourceATA, destATA, sourceTR, destTR common.PublicKey, err error) {
+func (t Transfer) addresses(pnft bool) (sourceATA, destATA, sourceTR, destTR common.PublicKey, err error) {
 	sourceATA, _, err = common.FindAssociatedTokenAddress(t.sender, t.mint)
 	if err != nil {
 		return sourceATA, destATA, sourceTR, destTR, fmt.Errorf("no associated token address for source: %w", err)
