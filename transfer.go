@@ -86,13 +86,11 @@ func AccountFromEnvJSON(env string) (Account, error) {
 
 type Client struct {
 	rpc *client.Client
-	ctx context.Context
 }
 
-func NewClient(ctx context.Context, endpoint string) *Client {
+func NewClient(endpoint string) *Client {
 	return &Client{
 		rpc: client.NewClient(endpoint),
-		ctx: ctx,
 	}
 }
 
@@ -150,8 +148,8 @@ func (asset Asset) Collection() (common.PublicKey, bool) {
 	return common.PublicKey{}, false
 }
 
-func (c Client) assetProof(mint common.PublicKey) (AssetProof, error) {
-	bytes, err := c.rpc.RpcClient.Call(c.ctx, "getAssetProof", mint.String())
+func (c Client) assetProof(ctx context.Context, mint common.PublicKey) (AssetProof, error) {
+	bytes, err := c.rpc.RpcClient.Call(ctx, "getAssetProof", mint.String())
 	if err != nil {
 		return AssetProof{}, err
 	}
@@ -171,8 +169,8 @@ func (c Client) assetProof(mint common.PublicKey) (AssetProof, error) {
 	return output.Result, nil
 }
 
-func (c Client) asset(mint common.PublicKey) (Asset, error) {
-	bytes, err := c.rpc.RpcClient.Call(c.ctx, "getAsset", mint.String())
+func (c Client) asset(ctx context.Context, mint common.PublicKey) (Asset, error) {
+	bytes, err := c.rpc.RpcClient.Call(ctx, "getAsset", mint.String())
 	if err != nil {
 		return Asset{}, fmt.Errorf("asset: %w", err)
 	}
@@ -225,13 +223,13 @@ func (c Client) mplCoreIx(asset Asset, transfer Transfer) (*types.Instruction, e
 	}, nil
 }
 
-func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error) {
+func (c Client) mplTokenMetadataIx(ctx context.Context, transfer Transfer) (*types.Instruction, error) {
 	metadata, err := token_metadata.GetTokenMetaPubkey(transfer.mint)
 	if err != nil {
 		return nil, fmt.Errorf("no token metadata address: %w", err)
 	}
 
-	md, err := c.getTokenMetadata(metadata)
+	md, err := c.getTokenMetadata(ctx, metadata)
 	if err != nil {
 		return nil, fmt.Errorf("no token metadata: %w", err)
 	}
@@ -295,7 +293,7 @@ func (c Client) mplTokenMetadataIx(transfer Transfer) (*types.Instruction, error
 	}, nil
 }
 
-func (c Client) mplBubblegumIx(asset Asset, transfer Transfer) (*types.Instruction, error) {
+func (c Client) mplBubblegumIx(ctx context.Context, asset Asset, transfer Transfer) (*types.Instruction, error) {
 	type TransferInstructionData struct {
 		Discriminator [8]byte
 		Root          [32]byte
@@ -305,7 +303,7 @@ func (c Client) mplBubblegumIx(asset Asset, transfer Transfer) (*types.Instructi
 		Index         uint64
 	}
 
-	assetProof, err := c.assetProof(transfer.mint)
+	assetProof, err := c.assetProof(ctx, transfer.mint)
 	if err != nil {
 		return nil, fmt.Errorf("mplbubblegum ix: %w", err)
 	}
@@ -372,8 +370,8 @@ func (c Client) mplBubblegumIx(asset Asset, transfer Transfer) (*types.Instructi
 	return &types.Instruction{ProgramID: programID, Accounts: accounts, Data: data}, nil
 }
 
-func (c Client) transferIx(transfer Transfer) (*types.Instruction, error) {
-	asset, err := c.asset(transfer.mint)
+func (c Client) transferIx(ctx context.Context, transfer Transfer) (*types.Instruction, error) {
+	asset, err := c.asset(ctx, transfer.mint)
 	if err != nil {
 		return nil, fmt.Errorf("transfer ix: %w", err)
 	}
@@ -386,23 +384,23 @@ func (c Client) transferIx(transfer Transfer) (*types.Instruction, error) {
 
 	switch protocol {
 	case MplBubblegum:
-		return c.mplBubblegumIx(asset, transfer)
+		return c.mplBubblegumIx(ctx, asset, transfer)
 	case MplCore:
 		return c.mplCoreIx(asset, transfer)
 	case MplTokenMetadata:
-		return c.mplTokenMetadataIx(transfer)
+		return c.mplTokenMetadataIx(ctx, transfer)
 	default:
 		return nil, fmt.Errorf("unknown protocol: %s", protocol)
 	}
 }
 
-func (c Client) transaction(transfer Transfer) (types.Transaction, error) {
-	ix, err := c.transferIx(transfer)
+func (c Client) transaction(ctx context.Context, transfer Transfer) (types.Transaction, error) {
+	ix, err := c.transferIx(ctx, transfer)
 	if err != nil {
 		return types.Transaction{}, fmt.Errorf("cannot build instruction: %w", err)
 	}
 
-	recentBlockhashResponse, err := c.rpc.GetLatestBlockhash(c.ctx)
+	recentBlockhashResponse, err := c.rpc.GetLatestBlockhash(ctx)
 	if err != nil {
 		return types.Transaction{}, fmt.Errorf("no recent blockhash: %w", err)
 	}
@@ -426,8 +424,8 @@ func (c Client) transaction(transfer Transfer) (types.Transaction, error) {
 	})
 }
 
-func (c Client) RawTx(transfer Transfer) (string, error) {
-	tx, err := c.transaction(transfer)
+func (c Client) RawTx(ctx context.Context, transfer Transfer) (string, error) {
+	tx, err := c.transaction(ctx, transfer)
 	if err != nil {
 		return "", fmt.Errorf("cannot build transaction: %w", err)
 	}
@@ -440,8 +438,8 @@ func (c Client) RawTx(transfer Transfer) (string, error) {
 	return base64.StdEncoding.EncodeToString(rawTx), nil
 }
 
-func (c Client) Do(transfer Transfer, signer Account) (string, error) {
-	tx, err := c.transaction(transfer)
+func (c Client) Do(ctx context.Context, transfer Transfer, signer Account) (string, error) {
+	tx, err := c.transaction(ctx, transfer)
 	if err != nil {
 		return "", fmt.Errorf("cannot build transaction: %w", err)
 	}
@@ -457,7 +455,7 @@ func (c Client) Do(transfer Transfer, signer Account) (string, error) {
 
 	slog.Debug("Do", "tx", tx, "err", err)
 
-	sig, err := c.rpc.SendTransaction(c.ctx, tx)
+	sig, err := c.rpc.SendTransaction(ctx, tx)
 	if err != nil {
 		return "", fmt.Errorf("cannot send tx: %w", err)
 	}
@@ -467,8 +465,8 @@ func (c Client) Do(transfer Transfer, signer Account) (string, error) {
 	return sig, nil
 }
 
-func (c Client) getTokenMetadata(address common.PublicKey) (token_metadata.Metadata, error) {
-	accountInfo, err := c.rpc.GetAccountInfo(c.ctx, address.String())
+func (c Client) getTokenMetadata(ctx context.Context, address common.PublicKey) (token_metadata.Metadata, error) {
+	accountInfo, err := c.rpc.GetAccountInfo(ctx, address.String())
 	if err != nil {
 		return token_metadata.Metadata{}, fmt.Errorf("no account info: %w", err)
 	}
